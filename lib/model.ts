@@ -8,7 +8,7 @@
 //
 // The implied value is the product of three factors, each from the snapshot's own figures:
 //
-//   implied = tvl_usd x multiple(category) x growthMult x maturityMult
+//   implied = tvl_usd x multiple(category) x growthMult x maturityMult x chainMult
 //
 //   multiple(category) — calibrated on the live cohort. For every protocol whose token already trades
 //     and whose record carries both a market cap and a TVL, take mcap_usd / tvl_usd: what the market
@@ -17,8 +17,8 @@
 //     all ratios (one token with a tiny TVL and a huge market cap must not set a category's price),
 //     shrunk toward the global median with six pseudo-observations, and only used when at least three
 //     live protocols of that category report both figures; otherwise the category takes the global
-//     median. On this snapshot the global median is about 0.20 and the category multiples land
-//     between about 0.08 and 0.61.
+//     median. On this snapshot the global median is about 0.21 and the category multiples land
+//     between about 0.11 and 0.62.
 //
 //   growthMult — the seven-day TVL change, clamped to [-50, +100] per cent so one viral week cannot
 //     set a protocol's price, weighted 0.6:
@@ -31,6 +31,14 @@
 //     Age is the days from listed_at to the snapshot's as_of date. A protocol with no listed_at is
 //     scored at the median age of the pre-token cohort, computed from the snapshot at run time
 //     (513 days on this snapshot), never at a hardcoded guess.
+//
+//   chainMult — how widely the protocol is deployed, on a log scale over ten chains, from 0.90 for a
+//     protocol on one chain to 1.10 for a protocol on ten or more:
+//       chainMult = 0.90 + 0.20 x min(1, ln(1 + chains) / ln(1 + 10))
+//     A protocol on more chains reaches more users and more integrations, so its token would price
+//     off a wider base; the factor is small on purpose, so it never outranks TVL or the category
+//     multiple. On this snapshot 56% of pre-token protocols run on one chain and the median is one,
+//     so the factor mostly separates the multi-chain few from the single-chain many.
 //
 // The early radar — the pre-token protocols below the watchlist floor — is chosen by this same score,
 // not by raw TVL: the 160 highest-scoring rankable protocols under the floor. A protocol is rankable
@@ -79,6 +87,12 @@ export interface ModelConstants {
   maturity_range: number;
   /** The four-year horizon, in days, that maturity is measured against. */
   maturity_days: number;
+  /** Chain multiplier of a protocol on one chain. */
+  chain_floor: number;
+  /** Chain multiplier's range up to a protocol on ten or more chains. */
+  chain_range: number;
+  /** The chain count that earns the full chain multiplier. */
+  chain_scale: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -91,16 +105,19 @@ export const MODEL: ModelConstants = {
   maturity_floor: 0.7,
   maturity_range: 0.3,
   maturity_days: 1460,
+  chain_floor: 0.9,
+  chain_range: 0.2,
+  chain_scale: 10,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by model score. */
 export const EARLY_ROWS = 160;
 
 /** How many live-token protocols the Live token view carries, by market cap. */
-export const LIVE_ROWS = 24;
+export const LIVE_ROWS = 40;
 
 /** The calibration the snapshot's live cohort yields at run time. */
 export interface Calibration {
@@ -144,6 +161,7 @@ export interface BoardRow {
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
+    chain_multiplier: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -193,11 +211,16 @@ export interface RadarData {
     multiples: Record<string, number>;
   };
   watchlist_size: number;
+  /** Every slug on the snapshot's watchlist, so the page can mark and filter watchlist rows. */
+  watchlist: string[];
   board_size: number;
   early_size: number;
   live_size: number;
   rows: RadarRow[];
   live: LiveRow[];
+  /** The three largest live-token protocols of each category, by market cap: the comparables the
+   * category multiple is calibrated on, shown in each protocol's detail view. */
+  comparables: Record<string, LiveRow[]>;
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -281,13 +304,18 @@ export function multipleFor(p: SnapshotProtocol, calibration: Calibration): numb
   return calibration.multiples.get(p.category ?? 'Other') ?? calibration.global_median;
 }
 
-/** The three multipliers and the implied value one protocol gets under the calibration. */
+/** The chain-breadth multiplier: how widely a protocol is deployed, log-scaled over chain_scale chains. */
+export function chainMultiplier(chains: number, model: ModelConstants): number {
+  return model.chain_floor + model.chain_range * Math.min(1, Math.log1p(Math.max(chains, 0)) / Math.log1p(model.chain_scale));
+}
+
+/** The four multipliers and the implied value one protocol gets under the calibration. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   calibration: Calibration,
   model: ModelConstants,
-): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
@@ -297,8 +325,9 @@ export function impliedValue(
     model.maturity_floor +
     model.maturity_range * Math.min(1, Math.log1p(Math.max(ageForModel, 0)) / Math.log1p(model.maturity_days));
   const multiple = multipleFor(protocol, calibration);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult));
-  return { implied, multiple, growthPct, growthMult, maturityMult, age };
+  const chainMult = chainMultiplier(protocol.chains.length, model);
+  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
+  return { implied, multiple, growthPct, growthMult, maturityMult, chainMult, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -362,6 +391,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
+      chain_multiplier: round4(s.chainMult),
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
@@ -494,9 +524,53 @@ function weeklyActionFor(p: SnapshotProtocol): string {
   return 'a deposit, a swap, a vote or a claim';
 }
 
+/** The risk check before any capital moves, from the protocol's own seven-day TVL change. */
+function riskStepFor(p: SnapshotProtocol, capital: number): string {
+  const g = p.change_7d;
+  if (g !== null && g <= -10) {
+    return `Before depositing, check why ${p.name}'s TVL fell ${Math.abs(g).toFixed(1)}% in seven days — read the protocol's own announcements and its audit record; if the fall is unexplained, halve the position to $${Math.round(capital / 2)} and wait a week.`;
+  }
+  if (g !== null && g >= 20) {
+    return `${p.name}'s TVL rose ${g.toFixed(1)}% in seven days, so the pool is crowded and the yield will compress; deposit the planned $${capital} but re-check the rate after a week before adding more.`;
+  }
+  return `Before depositing, read ${p.name}'s audit record and its last two announcements on its own site; a protocol with no audit or no announcement in months gets half the planned $${capital}.`;
+}
+
+/** A second use of the protocol's own features, by category, so the wallet's history is not a single deposit. */
+function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) {
+    return `Borrow $25 of USDC against the deposit and repay it the same week, so the wallet shows both sides of the market.`;
+  }
+  if (c.includes('dex') || c.includes('leveraged farm') || c.includes('liquidity manager')) {
+    return `Stake the LP receipt in ${name}'s gauge or rewards contract if it has one, and vote once in the next gauge round.`;
+  }
+  if (c.includes('yield')) {
+    return `Stake the vault shares in ${name}'s rewards contract if it offers one, and claim the rewards weekly instead of letting them sit.`;
+  }
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('options')) {
+    return `Keep the trade small and hedged, close it before the funding window resets, and log the funding paid.`;
+  }
+  if (c.includes('bridge') || c.includes('cross chain')) {
+    return `Bridge a second, smaller amount back the other way, so the wallet shows round-trip use of ${name}.`;
+  }
+  if (c.includes('staking') || c.includes('restak')) {
+    return `Delegate a second small stake to a different validator or operator through ${name}.`;
+  }
+  if (c.includes('governance')) {
+    return `Vote a second time in the next round and leave a short forum comment on the proposal.`;
+  }
+  if (c.includes('prediction')) {
+    return `Take a second small position in a different market that settles within the month.`;
+  }
+  return `Use one more of ${name}'s own features once — a swap, a vote or a claim — so the wallet's history is not a single deposit.`;
+}
+
 /**
- * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
- * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
+ * A protocol's farm plan: nine steps, each an action with a cost and a time. The plan is derived
+ * from the protocol's own record (category, chains, TVL, age, seven-day change), never from a
+ * hand-written list of names.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
@@ -511,6 +585,8 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   return [
     { text: walletLine, cost: `under $3 of gas for the first transaction`, time: '10 minutes' },
     { text: actionFor(p, capital, chain), cost: `$${capital} of capital and ${gas}`, time: '15 minutes to set up' },
+    { text: riskStepFor(p, capital), cost: `no capital moves until the check passes`, time: '15 minutes' },
+    { text: secondActionFor(p, capital, chain), cost: gas, time: '10 minutes' },
     {
       text: `Do one qualifying action every week, such as ${weekly}, so the wallet shows steady use rather than a single deposit.`,
       cost: gas.replace('per transaction', 'a week'),
@@ -556,6 +632,35 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
     }));
 }
 
+/** The three largest live-token protocols of each category, by market cap: the comparables each
+ * category's multiple is calibrated on. Drawn from the whole live cohort, not just the Live token
+ * view's top slice, so every category with live protocols shows three. A category with no live
+ * protocol gets no comparables. */
+export function liveComparables(snapshot: Snapshot): Record<string, LiveRow[]> {
+  const allLive = snapshot.protocols
+    .filter((p) => !isPreToken(p) && p.category !== 'CEX' && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
+    .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
+    .map((p) => ({
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      chains: p.chains,
+      tvl_usd: p.tvl_usd,
+      mcap_usd: p.mcap_usd,
+      change_7d: p.change_7d,
+    }));
+  const byCategory = new Map<string, LiveRow[]>();
+  for (const p of allLive) {
+    const key = p.category ?? 'Other';
+    const list = byCategory.get(key);
+    if (list) list.push(p);
+    else byCategory.set(key, [p]);
+  }
+  const out: Record<string, LiveRow[]> = {};
+  for (const [key, list] of [...byCategory.entries()].sort()) out[key] = list.slice(0, 3);
+  return out;
+}
+
 /** A board row's compact form for data.js, with the farm plan generated in the page. */
 export function radarRow(row: BoardRow): RadarRow {
   return {
@@ -598,11 +703,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       multiples,
     },
     watchlist_size: snapshot.watchlist.length,
+    watchlist: [...snapshot.watchlist],
     board_size: board.length,
     early_size: early,
     live_size: live.length,
     rows: board.map(radarRow),
     live,
+    comparables: liveComparables(snapshot),
   };
   return { board, radar, calibration };
 }
