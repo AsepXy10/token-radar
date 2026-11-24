@@ -6,9 +6,9 @@
 // ranking. No protocol name is ever special-cased: one function scores every row, and every number in
 // it is either read from the snapshot or computed from the snapshot at run time.
 //
-// The implied value is the product of three factors, each from the snapshot's own figures:
+// The implied value is the product of six factors, each from the snapshot's own figures:
 //
-//   implied = tvl_usd x multiple(category) x growthMult x maturityMult x chainMult
+//   implied = tvl_usd x multiple(category) x sizeTilt x growthMult x maturityMult x chainMult x launchMult
 //
 //   multiple(category) — calibrated on the live cohort. For every protocol whose token already trades
 //     and whose record carries both a market cap and a TVL, take mcap_usd / tvl_usd: what the market
@@ -20,10 +20,19 @@
 //     median. On this snapshot the global median is about 0.21 and the category multiples land
 //     between about 0.11 and 0.62.
 //
-//   growthMult — the seven-day TVL change, clamped to [-50, +100] per cent so one viral week cannot
-//     set a protocol's price, weighted 0.6:
-//       growthMult = 1 + clamp(change_7d, -50, 100) / 100 x 0.6
-//     A protocol with no reported change is scored at zero growth.
+//   sizeTilt — the market's diminishing return per TVL dollar at scale. The live cohort's
+//     log-log fit of market cap on TVL has slope 0.52 (R-squared 0.19, n = 128), so the multiple
+//     falls as TVL rises; the model takes a fifth of that tilt, (TVL / $100M)^-0.10, clamped to
+//     [0.60, 1.30], so a giant is priced closer to the market's own curve without being buried
+//     by a noisy fit.
+//   growthMult — the seven-day TVL change RELATIVE to its category's own weather: the median
+//     seven-day change of the category's pre-token cohort (the global pre-token median where the
+//     category has fewer than five), clamped to [-50, +100] per cent so one viral week cannot set
+//     a protocol's price, weighted 0.6:
+//       growthMult = 1 + clamp(change_7d - categoryMedian, -50, 100) / 100 x 0.6
+//     A protocol holding steady while its category falls 11% is growing; one rising 1% while its
+//     category rises 1% is standing still. A protocol with no reported change is scored at its
+//     category's median.
 //
 //   maturityMult — how long the protocol has run with no token, on a log scale over a four-year
 //     horizon, from 0.70 for a brand-new listing to 1.00 for a four-year record:
@@ -40,9 +49,22 @@
 //     multiple. On this snapshot 56% of pre-token protocols run on one chain and the median is one,
 //     so the factor mostly separates the multi-chain few from the single-chain many.
 //
-// The early radar — the pre-token protocols below the watchlist floor — is chosen by this same score,
-// not by raw TVL: the 160 highest-scoring rankable protocols under the floor. A protocol is rankable
-// when it records no token, is not a CEX, and its name does not end in a version marker.
+//   launchMult — how likely the category is to issue a token at all. Among protocols listed
+//     more than two years ago, the share that already trades a token, per category, shrunk
+//     toward the global old-cohort rate (0.68): Lending 0.88 and Dexs 0.78 against Bridge 0.59
+//     and Liquid Staking 0.62. The old cohort is what makes the prior honest: a new category
+//     like Risk Curators has no old protocols yet, so it takes the global rate instead of being
+//     punished for being young. Mapped to [0.95, 1.08], so it refines the ranking without
+//     overturning it.
+// The early radar is every rankable pre-token protocol the watchlist leaves out. A protocol is
+// rankable when it records no token AND it is not a wrapped, staked or bridged product of a
+// token that already trades: the house watchlist's own exclusion rule, minus the TVL floor —
+// its category is not Bridge, Canonical Bridge, Liquid Staking, Liquid Restaking, Restaked
+// BTC or CEX, its name carries no whole word wrapped, staked or staking, does not begin with
+// an exchange's name, and does not end in a version marker. Without the rule the board's top
+// fills with bridges and wrapped bitcoin (WBTC, Coinbase Bridge, Binance staked ETH), which
+// are not protocols waiting to launch a token: WBTC IS a token, and a bridge moves tokens
+// that already trade.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -93,6 +115,24 @@ export interface ModelConstants {
   chain_range: number;
   /** The chain count that earns the full chain multiplier. */
   chain_scale: number;
+  /** The exponent of the size tilt: the multiple is tilted by (TVL / size_tilt_ref) raised to
+   * minus this, so the market's diminishing return per TVL dollar at scale is in the price. */
+  size_tilt_exp: number;
+  /** The TVL the size tilt is measured against, in whole US dollars. */
+  size_tilt_ref: number;
+  /** The size tilt's floor and ceiling. */
+  size_tilt_min: number;
+  size_tilt_max: number;
+  /** The age, in days, a protocol must be listed before it counts toward a category's launch
+   * prior: only protocols old enough to have had their chance to launch inform it. */
+  launch_age_days: number;
+  /** Old protocols of a category needed before its own launch prior is used. */
+  launch_min_n: number;
+  /** Pseudo-observations of the global old-cohort launch rate mixed into a category's prior. */
+  launch_shrink_k: number;
+  /** The launch multiplier's floor and ceiling. */
+  launch_min: number;
+  launch_max: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -108,16 +148,32 @@ export const MODEL: ModelConstants = {
   chain_floor: 0.9,
   chain_range: 0.2,
   chain_scale: 10,
+  size_tilt_exp: 0.1,
+  size_tilt_ref: 100_000_000,
+  size_tilt_min: 0.6,
+  size_tilt_max: 1.3,
+  launch_age_days: 730,
+  launch_min_n: 5,
+  launch_shrink_k: 5,
+  launch_min: 0.95,
+  launch_max: 1.08,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3';
-
-/** How many pre-token protocols below the watchlist floor the early radar carries, by model score. */
-export const EARLY_ROWS = 160;
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 40;
+
+/** How many rows of the board the dashboard's data carries: the whole board, since data.js
+ * sits beside the page and is not part of the dossier's 64 KiB source text. */
+export const DASH_ROWS = 400;
+
+/** An early find is listed under a year and below the watchlist floor. */
+export const EARLY_FIND_MAX_AGE = 365;
+
+/** How many early finds the dashboard's rail shows. */
+export const EARLY_FINDS = 10;
 
 /** The calibration the snapshot's live cohort yields at run time. */
 export interface Calibration {
@@ -131,6 +187,16 @@ export interface Calibration {
   median_pre_age: number;
   /** How many live protocols carried both a market cap and a TVL. */
   live_priced: number;
+  /** The median seven-day TVL change of the pre-token cohort of each category, and the global
+   * median over every pre-token protocol that reports one: growth is scored against its own
+   * category's weather, not against zero. */
+  growth_medians: Map<string, number>;
+  global_growth_median: number;
+  /** Each category's launch prior: the share of its protocols listed more than launch_age_days
+   * ago that already trade a token, shrunk toward the global old-cohort rate; and the global
+   * old-cohort rate itself. A category with too few old protocols takes the global rate. */
+  launch_priors: Map<string, { prior: number; n: number }>;
+  global_launch_prior: number;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -158,10 +224,13 @@ export interface BoardRow {
   implied_value_usd: number;
   model: {
     category_multiple: number;
-    growth_pct: number;
+    relative_growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
     chain_multiplier: number;
+    size_multiplier: number;
+    launch_multiplier: number;
+    launch_prior: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -183,6 +252,10 @@ export interface RadarRow {
   category_multiple: number;
   growth_multiplier: number;
   maturity_multiplier: number;
+  size_multiplier: number;
+  launch_multiplier: number;
+  launch_prior: number;
+  relative_growth_pct: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -209,6 +282,10 @@ export interface RadarData {
     median_pre_age: number;
     live_priced: number;
     multiples: Record<string, number>;
+    growth_medians: Record<string, number>;
+    global_growth_median: number;
+    launch_priors: Record<string, { prior: number; n: number }>;
+    global_launch_prior: number;
   };
   watchlist_size: number;
   /** Every slug on the snapshot's watchlist, so the page can mark and filter watchlist rows. */
@@ -216,6 +293,13 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  /** The whole pre-token cohort and the rankable set it holds, so the page can state its
+   * coverage honestly: the board is every rankable protocol, not a slice. */
+  pre_token_total: number;
+  rankable_total: number;
+  /** The early finds: the highest-implied-value rankable protocols listed under a year and
+   * below the watchlist floor — the future airdrops the radar exists to find early. */
+  early_finds: { slug: string; name: string; category: string | null; age_days: number | null; tvl_usd: number; implied_value_usd: number }[];
   rows: RadarRow[];
   live: LiveRow[];
   /** The three largest live-token protocols of each category, by market cap: the comparables the
@@ -290,12 +374,60 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
     .map((p) => ageDays(snapshot.as_of, p.listed_at))
     .filter((a): a is number => a !== null)
     .sort((a, b) => a - b);
+  // Growth is benchmarked: the median seven-day change of each category's pre-token cohort,
+  // and the global median over every pre-token protocol that reports one.
+  const growthByCat = new Map<string, number[]>();
+  const growthAll: number[] = [];
+  for (const p of snapshot.protocols) {
+    if (!isPreToken(p) || p.change_7d === null) continue;
+    growthAll.push(p.change_7d);
+    const key = p.category ?? 'Other';
+    const list = growthByCat.get(key);
+    if (list) list.push(p.change_7d);
+    else growthByCat.set(key, [p.change_7d]);
+  }
+  growthAll.sort((a, b) => a - b);
+  const globalGrowthMedian = growthAll.length > 0 ? medianSorted(growthAll) : 0;
+  const growthMedians = new Map<string, number>();
+  for (const [cat, list] of growthByCat) {
+    if (list.length < 5) continue;
+    list.sort((a, b) => a - b);
+    growthMedians.set(cat, medianSorted(list));
+  }
+  // Launch prior: among protocols listed more than launch_age_days ago, the share that already
+  // trades a token, per category, shrunk toward the global old-cohort rate. A new category has
+  // no old protocols and takes the global rate, so youth is never punished for being young.
+  const oldByCat = new Map<string, { live: number; total: number }>();
+  let oldLive = 0;
+  let oldTotal = 0;
+  for (const p of snapshot.protocols) {
+    const a = ageDays(snapshot.as_of, p.listed_at);
+    if (a === null || a <= model.launch_age_days) continue;
+    oldTotal++;
+    if (!isPreToken(p)) oldLive++;
+    const key = p.category ?? 'Other';
+    const e = oldByCat.get(key) ?? { live: 0, total: 0 };
+    e.total++;
+    if (!isPreToken(p)) e.live++;
+    oldByCat.set(key, e);
+  }
+  const globalLaunchPrior = oldTotal > 0 ? oldLive / oldTotal : 0.5;
+  const launchPriors = new Map<string, { prior: number; n: number }>();
+  for (const [cat, e] of oldByCat) {
+    if (e.total < model.launch_min_n) continue;
+    const prior = (e.live + model.launch_shrink_k * globalLaunchPrior) / (e.total + model.launch_shrink_k);
+    launchPriors.set(cat, { prior, n: e.total });
+  }
   return {
     global_median: globalMedian,
     p90_ratio: p90,
     multiples,
     median_pre_age: preAges.length > 0 ? medianSorted(preAges) : 365,
     live_priced: live.length,
+    growth_medians: growthMedians,
+    global_growth_median: globalGrowthMedian,
+    launch_priors: launchPriors,
+    global_launch_prior: globalLaunchPrior,
   };
 }
 
@@ -309,33 +441,98 @@ export function chainMultiplier(chains: number, model: ModelConstants): number {
   return model.chain_floor + model.chain_range * Math.min(1, Math.log1p(Math.max(chains, 0)) / Math.log1p(model.chain_scale));
 }
 
-/** The four multipliers and the implied value one protocol gets under the calibration. */
+/** The median seven-day change of a protocol's category's pre-token cohort, else the global
+ * pre-token median: the weather its own growth is scored against. */
+export function growthMedianFor(p: SnapshotProtocol, calibration: Calibration): number {
+  return calibration.growth_medians.get(p.category ?? 'Other') ?? calibration.global_growth_median;
+}
+
+/** A protocol's seven-day change relative to its category's median, in percentage points. */
+export function relativeGrowth(p: SnapshotProtocol, calibration: Calibration): number {
+  return finite(p.change_7d, 0) - growthMedianFor(p, calibration);
+}
+
+/** A protocol's category's launch prior and how many old protocols it rests on. */
+export function launchPriorFor(p: SnapshotProtocol, calibration: Calibration): { prior: number; n: number } {
+  return calibration.launch_priors.get(p.category ?? 'Other') ?? { prior: calibration.global_launch_prior, n: 0 };
+}
+
+/** The launch multiplier: the prior mapped onto [launch_min, launch_max], so a category whose
+ * old protocols almost all launched scores near the ceiling and one whose old protocols rarely
+ * did scores near the floor. */
+export function launchMultiplier(p: SnapshotProtocol, calibration: Calibration, model: ModelConstants): number {
+  const { prior } = launchPriorFor(p, calibration);
+  const t = Math.min(1, Math.max(0, (prior - 0.3) / 0.7));
+  return model.launch_min + (model.launch_max - model.launch_min) * t;
+}
+
+/** The size tilt: (TVL / size_tilt_ref) to the minus size_tilt_exp, clamped. */
+export function sizeTilt(tvlUsd: number, model: ModelConstants): number {
+  const tilt = Math.pow(Math.max(tvlUsd, 1) / model.size_tilt_ref, -model.size_tilt_exp);
+  return Math.min(model.size_tilt_max, Math.max(model.size_tilt_min, tilt));
+}
+
+/** The six multipliers and the implied value one protocol gets under the calibration. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   calibration: Calibration,
   model: ModelConstants,
-): { implied: number; multiple: number; growthPct: number; growthMult: number; maturityMult: number; chainMult: number; age: number | null } {
+): {
+  implied: number;
+  multiple: number;
+  relGrowthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  chainMult: number;
+  sizeMult: number;
+  launchMult: number;
+  launchPrior: number;
+  age: number | null;
+} {
   const age = ageDays(asOf, protocol.listed_at);
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
+  const relGrowth = relativeGrowth(protocol, calibration);
+  const relGrowthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, relGrowth));
+  const growthMult = 1 + (relGrowthPct / 100) * model.growth_weight;
   const ageForModel = age ?? calibration.median_pre_age;
   const maturityMult =
     model.maturity_floor +
     model.maturity_range * Math.min(1, Math.log1p(Math.max(ageForModel, 0)) / Math.log1p(model.maturity_days));
   const multiple = multipleFor(protocol, calibration);
   const chainMult = chainMultiplier(protocol.chains.length, model);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
-  return { implied, multiple, growthPct, growthMult, maturityMult, chainMult, age };
+  const sizeMult = sizeTilt(protocol.tvl_usd, model);
+  const launchMult = launchMultiplier(protocol, calibration, model);
+  const launchPrior = launchPriorFor(protocol, calibration).prior;
+  const implied = Math.max(
+    1,
+    Math.round(protocol.tvl_usd * multiple * sizeMult * growthMult * maturityMult * chainMult * launchMult),
+  );
+  return { implied, multiple, relGrowthPct, growthMult, maturityMult, chainMult, sizeMult, launchMult, launchPrior, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 
-/** Whether a protocol is one the board may rank: pre-token, not an exchange, not a versioned pool. */
+/** The categories the house watchlist's rule keeps off the board: a wrapped, staked or bridged
+ * product of a token that already trades is not a token that does not exist yet. */
+const EXCLUDED_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX']);
+
+/** A name carrying a whole word wrapped, staked or staking names such a product. */
+const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
+
+/** A name beginning with an exchange's name is the exchange's product, not a launch. */
+const EXCHANGE_PREFIX = /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/;
+
+/** Whether a protocol is one the board may rank: pre-token, and not a wrapped, staked or
+ * bridged product of a token that already trades, by the house rule minus the TVL floor. */
 export function isRankable(p: SnapshotProtocol): boolean {
-  return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
+  return (
+    isPreToken(p) &&
+    !EXCLUDED_CATEGORIES.has(p.category ?? '') &&
+    !VERSIONED.test(p.name) &&
+    !WRAPPED_WORD.test(p.name) &&
+    !EXCHANGE_PREFIX.test(p.name)
+  );
 }
 
 /** The snapshot's protocol by slug. */
@@ -354,16 +551,12 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  // The early radar: pre-token protocols below the watchlist floor, by model score, capped. Never a
-  // replacement for a watchlist row: a chosen protocol stays chosen. Ties break on slug, so the choice
-  // is the same on every run.
-  const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
-    .map((p) => ({ p, score: impliedValue(p, snapshot.as_of, calibration, model).implied }))
-    .sort((a, b) => b.score - a.score || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0))
-    .slice(0, EARLY_ROWS);
-  for (const e of early) chosen.set(e.p.slug, e.p);
+  // The early radar is every rankable protocol the watchlist leaves out, whatever its TVL, and
+  // the board is the whole rankable set. A chosen protocol stays chosen.
 
+  for (const p of snapshot.protocols) {
+    if (!chosen.has(p.slug) && isRankable(p)) chosen.set(p.slug, p);
+  }
   const scored = [...chosen.values()].map((p) => {
     const v = impliedValue(p, snapshot.as_of, calibration, model);
     return { p, ...v };
@@ -385,16 +578,19 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     age_days: s.age,
     implied_value_usd: s.implied,
     model: {
-      // Full precision, not rounded: the dashboard recomputes the row from this multiple and must
+      // Full precision, not rounded: the dashboard recomputes the row from these factors and must
       // land on exactly the implied value board.json carries.
       category_multiple: s.multiple,
-      growth_pct: s.growthPct,
+      relative_growth_pct: round4(s.relGrowthPct),
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       chain_multiplier: round4(s.chainMult),
+      size_multiplier: round4(s.sizeMult),
+      launch_multiplier: round4(s.launchMult),
+      launch_prior: round4(s.launchPrior),
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_steps: farmSteps(s.p, s.age, calibration).map(stepText),
   }));
 }
 
@@ -524,14 +720,18 @@ function weeklyActionFor(p: SnapshotProtocol): string {
   return 'a deposit, a swap, a vote or a claim';
 }
 
-/** The risk check before any capital moves, from the protocol's own seven-day TVL change. */
-function riskStepFor(p: SnapshotProtocol, capital: number): string {
+/** The risk check before any capital moves, from the protocol's own seven-day TVL change
+ * against its category's median: a fall that is worse than its peers is a warning, a rise that
+ * beats its peers is a crowd. */
+function riskStepFor(p: SnapshotProtocol, capital: number, calibration: Calibration): string {
   const g = p.change_7d;
-  if (g !== null && g <= -10) {
-    return `Before depositing, check why ${p.name}'s TVL fell ${Math.abs(g).toFixed(1)}% in seven days — read the protocol's own announcements and its audit record; if the fall is unexplained, halve the position to $${Math.round(capital / 2)} and wait a week.`;
+  const rel = relativeGrowth(p, calibration);
+  const med = growthMedianFor(p, calibration);
+  if (g !== null && rel <= -10) {
+    return `Before depositing, check why ${p.name}'s TVL fell ${Math.abs(g).toFixed(1)}% in seven days, ${Math.abs(rel).toFixed(1)} points worse than its category’s median of ${med.toFixed(1)}% — read the protocol’s own announcements and its audit record; if the fall is unexplained, halve the position to $${Math.round(capital / 2)} and wait a week.`;
   }
-  if (g !== null && g >= 20) {
-    return `${p.name}'s TVL rose ${g.toFixed(1)}% in seven days, so the pool is crowded and the yield will compress; deposit the planned $${capital} but re-check the rate after a week before adding more.`;
+  if (g !== null && rel >= 20) {
+    return `${p.name}'s TVL rose ${g.toFixed(1)}% in seven days, ${rel.toFixed(1)} points ahead of its category’s median of ${med.toFixed(1)}%, so the pool is crowded and the yield will compress; deposit the planned $${capital} but re-check the rate after a week before adding more.`;
   }
   return `Before depositing, read ${p.name}'s audit record and its last two announcements on its own site; a protocol with no audit or no announcement in months gets half the planned $${capital}.`;
 }
@@ -572,7 +772,7 @@ function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): s
  * from the protocol's own record (category, chains, TVL, age, seven-day change), never from a
  * hand-written list of names.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+export function farmSteps(p: SnapshotProtocol, age: number | null, calibration: Calibration): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
@@ -585,7 +785,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   return [
     { text: walletLine, cost: `under $3 of gas for the first transaction`, time: '10 minutes' },
     { text: actionFor(p, capital, chain), cost: `$${capital} of capital and ${gas}`, time: '15 minutes to set up' },
-    { text: riskStepFor(p, capital), cost: `no capital moves until the check passes`, time: '15 minutes' },
+    { text: riskStepFor(p, capital, calibration), cost: `no capital moves until the check passes`, time: '15 minutes' },
     { text: secondActionFor(p, capital, chain), cost: gas, time: '10 minutes' },
     {
       text: `Do one qualifying action every week, such as ${weekly}, so the wallet shows steady use rather than a single deposit.`,
@@ -678,6 +878,10 @@ export function radarRow(row: BoardRow): RadarRow {
     category_multiple: row.model.category_multiple,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
+    size_multiplier: row.model.size_multiplier,
+    launch_multiplier: row.model.launch_multiplier,
+    launch_prior: row.model.launch_prior,
+    relative_growth_pct: row.model.relative_growth_pct,
   };
 }
 
@@ -689,6 +893,25 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const multiples: Record<string, number> = {};
   for (const [k, v] of [...calibration.multiples.entries()].sort()) multiples[k] = round4(v);
+  // Full precision, not rounded: the page recomputes each row from these medians and priors
+  // and must land on exactly the implied value board.json carries.
+  const growthMedians: Record<string, number> = {};
+  for (const [k, v] of [...calibration.growth_medians.entries()].sort()) growthMedians[k] = v;
+  const launchPriors: Record<string, { prior: number; n: number }> = {};
+  for (const [k, v] of [...calibration.launch_priors.entries()].sort()) launchPriors[k] = { prior: v.prior, n: v.n };
+  const preTokenTotal = snapshot.protocols.filter(isPreToken).length;
+  const rankableTotal = snapshot.protocols.filter(isRankable).length;
+  const finds = board
+    .filter((r) => r.age_days !== null && r.age_days <= EARLY_FIND_MAX_AGE && r.tvl_usd < snapshot.floor_usd)
+    .slice(0, EARLY_FINDS)
+    .map((r) => ({
+      slug: r.slug,
+      name: r.name,
+      category: r.category,
+      age_days: r.age_days,
+      tvl_usd: r.tvl_usd,
+      implied_value_usd: r.implied_value_usd,
+    }));
   const radar: RadarData = {
     as_of: snapshot.as_of,
     source: snapshot.source,
@@ -701,13 +924,20 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
       median_pre_age: calibration.median_pre_age,
       live_priced: calibration.live_priced,
       multiples,
+      growth_medians: growthMedians,
+      global_growth_median: calibration.global_growth_median,
+      launch_priors: launchPriors,
+      global_launch_prior: calibration.global_launch_prior,
     },
     watchlist_size: snapshot.watchlist.length,
     watchlist: [...snapshot.watchlist],
     board_size: board.length,
     early_size: early,
     live_size: live.length,
-    rows: board.map(radarRow),
+    pre_token_total: preTokenTotal,
+    rankable_total: rankableTotal,
+    early_finds: finds,
+    rows: board.map(radarRow).slice(0, DASH_ROWS),
     live,
     comparables: liveComparables(snapshot),
   };
