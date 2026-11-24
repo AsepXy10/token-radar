@@ -63,5 +63,5 @@ Two runs to different directories produce byte-identical output. The dashboard p
 - `lib/model.ts` — the calibrated value model, board builder, and farm-plan generator.
 - `vendor/makefun-board.ts` — the make.fun dossier library.
 - `dashboard/` — `index.html`, `app.css`, `app.js` (dark radar theme, no network).
-- `screenshots/` — `1-board.jpg`, `2-detail.png`, `3-filtered.jpg`.
+- `screenshots/` — `1-board.jpg`, `2-detail.jpg`, `3-filtered.jpg`.
 - `LICENSE` (MIT).
