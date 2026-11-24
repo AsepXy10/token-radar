@@ -30,17 +30,37 @@
   }
 
   // The model, recomputed in the page from the snapshot figures, so the sheet can show the same
-  // arithmetic board.json carries: TVL times the category multiple, times the growth, maturity and
-  // chain multipliers. The multiple itself is calibrated in main.ts from the live cohort.
+  // arithmetic board.json carries: TVL times the category multiple, times the size tilt, the
+  // relative-growth, maturity, chain and launch multipliers. The multiple, the category growth
+  // medians and the launch priors are calibrated in main.ts from the snapshot's own cohorts.
+  function growthMedianOf(row) {
+    var medians = DATA.calibration.growth_medians || {};
+    var m = medians[row.category || 'Other'];
+    return (m === null || m === undefined) ? DATA.calibration.global_growth_median : m;
+  }
+  function launchPriorOf(row) {
+    var priors = DATA.calibration.launch_priors || {};
+    var entry = priors[row.category || 'Other'];
+    return entry ? entry.prior : DATA.calibration.global_launch_prior;
+  }
+  function launchMultOf(row, model) {
+    var t = Math.min(1, Math.max(0, (launchPriorOf(row) - 0.3) / 0.7));
+    return model.launch_min + (model.launch_max - model.launch_min) * t;
+  }
+  function sizeTiltOf(row, model) {
+    var tilt = Math.pow(Math.max(row.tvl_usd, 1) / model.size_tilt_ref, -model.size_tilt_exp);
+    return Math.min(model.size_tilt_max, Math.max(model.size_tilt_min, tilt));
+  }
   function impliedOf(row, model) {
     var g = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
-    g = Math.min(model.growth_cap, Math.max(model.growth_floor, g));
-    var growthMult = 1 + (g / 100) * model.growth_weight;
+    var rel = g - growthMedianOf(row);
+    rel = Math.min(model.growth_cap, Math.max(model.growth_floor, rel));
+    var growthMult = 1 + (rel / 100) * model.growth_weight;
     var age = row.age_days === null || row.age_days === undefined ? DATA.calibration.median_pre_age : row.age_days;
     var maturity = model.maturity_floor + model.maturity_range * Math.min(1, Math.log(1 + Math.max(age, 0)) / Math.log(1 + model.maturity_days));
     var chains = row.chains ? row.chains.length : 0;
     var chainMult = model.chain_floor + model.chain_range * Math.min(1, Math.log(1 + Math.max(chains, 0)) / Math.log(1 + model.chain_scale));
-    return Math.max(1, Math.round(row.tvl_usd * row.category_multiple * growthMult * maturity * chainMult));
+    return Math.max(1, Math.round(row.tvl_usd * row.category_multiple * sizeTiltOf(row, model) * growthMult * maturity * chainMult * launchMultOf(row, model)));
   }
   function chainMultOf(row, model) {
     var chains = row.chains ? row.chains.length : 0;
@@ -137,11 +157,13 @@
   }
   function riskStepFor(p, capital) {
     var g = p.change_7d;
-    if (g !== null && g !== undefined && g <= -10) {
-      return 'Before depositing, check why ' + p.name + "'s TVL fell " + Math.abs(g).toFixed(1) + '% in seven days — read the protocol\'s own announcements and its audit record; if the fall is unexplained, halve the position to $' + Math.round(capital / 2) + ' and wait a week.';
+    var med = growthMedianOf(p);
+    var rel = (g === null || g === undefined ? 0 : g) - med;
+    if (g !== null && g !== undefined && rel <= -10) {
+      return 'Before depositing, check why ' + p.name + "'s TVL fell " + Math.abs(g).toFixed(1) + '% in seven days, ' + Math.abs(rel).toFixed(1) + ' points worse than its category’s median of ' + med.toFixed(1) + '% — read the protocol’s own announcements and its audit record; if the fall is unexplained, halve the position to $' + Math.round(capital / 2) + ' and wait a week.';
     }
-    if (g !== null && g !== undefined && g >= 20) {
-      return p.name + "'s TVL rose " + g.toFixed(1) + '% in seven days, so the pool is crowded and the yield will compress; deposit the planned $' + capital + ' but re-check the rate after a week before adding more.';
+    if (g !== null && g !== undefined && rel >= 20) {
+      return p.name + "'s TVL rose " + g.toFixed(1) + '% in seven days, ' + rel.toFixed(1) + ' points ahead of its category’s median of ' + med.toFixed(1) + '%, so the pool is crowded and the yield will compress; deposit the planned $' + capital + ' but re-check the rate after a week before adding more.';
     }
     return 'Before depositing, read ' + p.name + "'s audit record and its last two announcements on its own site; a protocol with no audit or no announcement in months gets half the planned $" + capital + '.';
   }
@@ -220,6 +242,7 @@
       else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
+      else if (key === 'launch') { av = a.launch_prior === null || a.launch_prior === undefined ? 0 : a.launch_prior; bv = b.launch_prior === null || b.launch_prior === undefined ? 0 : b.launch_prior; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -252,13 +275,13 @@
           el('b', { text: '$' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL' }),
           ' and no token on record. The early radar adds ',
           el('b', { text: DATA.early_size + ' pre-token protocols' }),
-          ' below that floor, picked by model score. Implied value is a model, not a promise — and never a prediction that a token will launch.'
+          ' the watchlist leaves out — every rankable pre-token protocol, ' + DATA.board_size + ' rows in all. Implied value is a model, not a promise — and never a prediction that a token will launch.'
         )
       ),
       el('div', { class: 'stats' },
         el('div', { class: 'stat' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
         el('div', { class: 'stat' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
-        el('div', { class: 'stat' }, el('span', { text: 'Early rows below the floor' }), el('b', { text: String(DATA.early_size) })),
+        el('div', { class: 'stat' }, el('span', { text: 'Early rows beyond the watchlist' }), el('b', { text: String(DATA.early_size) })),
         el('div', { class: 'stat' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) })),
         el('div', { class: 'cats' },
           el('div', { class: 'stat' }, el('span', { text: 'Top categories on the board' }), el('b', { text: '' })),
@@ -342,6 +365,7 @@
           el('div', { class: 'meter', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
         )),
+        el('td', { class: 'num', text: r.launch_prior === null || r.launch_prior === undefined ? 'n/a' : Math.round(r.launch_prior * 100) + '%' }),
         el('td', null, el('span', { class: 'pill' + (WATCHLIST[r.slug] ? ' watch' : ''), text: WATCHLIST[r.slug] ? 'no token · watchlist' : 'no token' }))
       );
       tbody.appendChild(tr);
@@ -357,6 +381,7 @@
             sortHead('growth', '7d'),
             sortHead('age', 'Age'),
             sortHead('implied', 'Implied value'),
+            sortHead('launch', 'Launch'),
             el('th', { scope: 'col', text: 'Token' })
           )),
           tbody
@@ -397,17 +422,21 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'One function scores every row, from the snapshot figures alone. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        el('b', { text: 'implied = TVL x category multiple x growth multiplier x maturity multiplier x chain multiplier' }),
+        el('b', { text: 'implied = TVL x category multiple x size tilt x growth multiplier x maturity multiplier x chain multiplier x launch multiplier' }),
         el('br'),
         'category multiple: the median market-cap-per-TVL of live protocols in the category, winsorized at the 90th percentile (' + cal.p90_ratio + ') and shrunk toward the global median (' + cal.global_median + ') with ' + m.shrinkage_k + ' pseudo-observations; categories with fewer than ' + m.min_live_n + ' live protocols take the global median. ' + cal.live_priced + ' live protocols carried both figures.',
         el('br'),
-        'growth multiplier: 1 + clamp(7d change, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + '.',
+        'size tilt: (TVL / $' + Math.round(m.size_tilt_ref / 1e6) + 'M)^-' + m.size_tilt_exp + ', clamped to [' + m.size_tilt_min + ', ' + m.size_tilt_max + ']: the live cohort pays less per TVL dollar at scale (its log-log slope is 0.52), so a giant is priced closer to the market’s own curve.',
+        el('br'),
+        'growth multiplier: 1 + clamp(7d change minus its category’s median 7d change, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + '. The category medians come from the pre-token cohort; the global median is ' + cal.global_growth_median.toFixed(2) + '%.',
         el('br'),
         'maturity multiplier: ' + m.maturity_floor + ' + ' + m.maturity_range + ' x min(1, ln(1 + age) / ln(1 + ' + m.maturity_days + ')); an unlisted age uses the pre-token cohort median, ' + cal.median_pre_age + ' days.',
         el('br'),
-        'chain multiplier: ' + m.chain_floor + ' + ' + m.chain_range + ' x min(1, ln(1 + chains) / ln(1 + ' + m.chain_scale + ')); one chain scores ' + m.chain_floor + ' and ten or more score ' + (m.chain_floor + m.chain_range).toFixed(2) + '.'
+        'chain multiplier: ' + m.chain_floor + ' + ' + m.chain_range + ' x min(1, ln(1 + chains) / ln(1 + ' + m.chain_scale + ')); one chain scores ' + m.chain_floor + ' and ten or more score ' + (m.chain_floor + m.chain_range).toFixed(2) + '.',
+        el('br'),
+        'launch multiplier: ' + m.launch_min + ' to ' + m.launch_max + ' from the category’s launch prior — the share of its protocols listed over two years ago that already trade a token (' + Math.round(cal.global_launch_prior * 100) + '% across the old cohort). A new category takes the global rate, so youth is never punished for being young.'
       ),
-      el('p', { class: 'sub', text: 'The early radar is the 160 highest-scoring pre-token protocols below the watchlist floor. A protocol that records no token may still have one its DefiLlama record does not carry: this board says a protocol records no token, never that it has none.' })
+      el('p', { class: 'sub', text: 'The early radar is every rankable pre-token protocol the watchlist leaves out — ' + DATA.board_size + ' rows in all. A protocol that records no token may still have one its DefiLlama record does not carry: this board says a protocol records no token, never that it has none.' })
     );
   }
 
@@ -449,9 +478,12 @@
         el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
         el('div', null, el('span', { text: 'Chains deployed' }), el('b', { class: 'num', text: String(row.chains ? row.chains.length : 0) })),
         el('div', null, el('span', { text: 'Chain multiplier' }), el('b', { class: 'num', text: chainMultOf(row, DATA.model).toFixed(4) })),
+        el('div', null, el('span', { text: 'Size tilt' }), el('b', { class: 'num', text: String(row.size_multiplier) })),
+        el('div', null, el('span', { text: 'Growth vs its category' }), el('b', { class: 'num', text: fmtPct(row.relative_growth_pct) })),
+        el('div', null, el('span', { text: 'Launch likelihood' }), el('b', { class: 'num', text: Math.round(row.launch_prior * 100) + '%' })),
         el('div', { class: 'total' }, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' Launch likelihood is the share of this category’s protocols listed over two years ago that already trade a token. This is an estimate, not a price.' })
     ));
     var comps = (DATA.comparables || {})[row.category || 'Other'] || [];
     if (comps.length > 0) {
@@ -480,11 +512,29 @@
     }
   }
 
+  function earlyFinds() {
+    var finds = DATA.early_finds || [];
+    if (finds.length === 0) return null;
+    return el('section', { class: 'card finds' },
+      el('h2', { text: 'Early finds — listed under a year, below the floor' }),
+      el('p', { class: 'sub', text: 'The future airdrops, found early: the youngest pre-token protocols with the strongest implied value. Select one for its model and farm plan.' }),
+      el('div', { class: 'find-list' }, finds.map(function (f) {
+        return el('button', { type: 'button', class: 'find', onclick: function () { openSheet(f.slug); } },
+          el('b', { text: f.name }),
+          el('span', { class: 'sub', text: (f.category || 'Other') + ' · ' + fmtAge(f.age_days) + ' · ' + fmtUsd(f.tvl_usd) }),
+          el('span', { class: 'num', text: fmtUsd(f.implied_value_usd) })
+        );
+      }))
+    );
+  }
+
   function render() {
     app.textContent = '';
     var shell = el('div', { class: 'wrap' });
     shell.appendChild(masthead());
     shell.appendChild(intro());
+    var finds = earlyFinds();
+    if (finds) shell.appendChild(finds);
     shell.appendChild(toolbar());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') shell.appendChild(modelNote());
